@@ -1,0 +1,399 @@
+---
+title: "Mountain Project Climbing Route Recommender"
+author: "Mason Barnocky"
+format:
+  dashboard:
+    theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(leaflet)
+library(DT)
+
+US_STATES <- c(
+  "Alabama","Alaska","Arizona","Arkansas","California","Colorado",
+  "Connecticut","Delaware","Florida","Georgia","Hawaii","Idaho",
+  "Illinois","Indiana","Iowa","Kansas","Kentucky","Louisiana","Maine",
+  "Maryland","Massachusetts","Michigan","Minnesota","Mississippi",
+  "Missouri","Montana","Nebraska","Nevada","New Hampshire","New Jersey",
+  "New Mexico","New York","North Carolina","North Dakota","Ohio",
+  "Oklahoma","Oregon","Pennsylvania","Rhode Island","South Carolina",
+  "South Dakota","Tennessee","Texas","Utah","Vermont","Virginia",
+  "Washington","West Virginia","Wisconsin","Wyoming"
+)
+
+parse_grade_numeric <- function(rating) {
+  r        <- str_trim(rating)
+  base_num <- suppressWarnings(as.integer(str_match(r, "5\\.(\\d+)")[, 2]))
+  mod      <- str_extract(r, "[abcd+\\-]$")
+  dplyr::case_when(
+    is.na(base_num) ~ NA_real_,
+    mod == "a" ~ base_num * 10 + 0,
+    mod == "b" ~ base_num * 10 + 2,
+    mod == "c" ~ base_num * 10 + 5,
+    mod == "d" ~ base_num * 10 + 8,
+    mod == "+" ~ base_num * 10 + 9,
+    mod == "-" ~ base_num * 10 - 1,
+    TRUE       ~ base_num * 10 + 4
+  )
+}
+
+primary_type <- function(type_str) {
+  dplyr::case_when(
+    str_detect(type_str, regex("boulder", ignore_case = TRUE)) ~ "Boulder",
+    str_detect(type_str, regex("sport",   ignore_case = TRUE)) ~ "Sport",
+    str_detect(type_str, regex("trad",    ignore_case = TRUE)) ~ "Trad",
+    str_detect(type_str, regex("alpine",  ignore_case = TRUE)) ~ "Alpine",
+    TRUE ~ "Other"
+  )
+}
+
+clean_col_names <- function(df) {
+  names(df) <- trimws(names(df))
+  df <- df[, !(names(df) == "" | grepl("^Unnamed", names(df))), drop = FALSE]
+  names(df)[names(df) == "Avg Stars"]      <- "avg_stars"
+  names(df)[names(df) == "Route Type"]     <- "route_type"
+  names(df)[names(df) == "Pitches"]        <- "pitches"
+  names(df)[names(df) == "Area Latitude"]  <- "lat"
+  names(df)[names(df) == "Area Longitude"] <- "lon"
+  names(df)[names(df) == "Rating"]         <- "rating"
+  names(df)[names(df) == "num_votes"]      <- "num_votes"
+  df
+}
+
+build_routes <- function(raw) {
+  raw        <- clean_col_names(raw)
+  parts_list <- str_split(raw$Location, " > ")
+  raw$state  <- vapply(parts_list, function(p) { p <- trimws(p); p[length(p)] }, character(1))
+  raw$crag   <- vapply(parts_list, function(p) trimws(p)[1], character(1))
+  raw |>
+    filter(state %in% US_STATES,
+           !is.na(lat), !is.na(lon),
+           lat >= 18, lat <= 72, lon >= -180, lon <= -66) |>
+    mutate(
+      grade_num  = parse_grade_numeric(rating),
+      climb_type = primary_type(route_type),
+      num_votes  = pmax(1L, suppressWarnings(as.integer(num_votes)), na.rm = TRUE),
+      avg_stars  = as.numeric(avg_stars),
+      pitches    = pmax(1L, suppressWarnings(as.integer(pitches)), na.rm = TRUE),
+      is_classic = avg_stars >= 3.8 & num_votes >= 20,
+      route_tier = dplyr::case_when(
+        avg_stars >= 3.8 & num_votes >= 20 ~ "Classic",
+        avg_stars >= 3.2 & num_votes >= 10 ~ "Solid",
+        avg_stars >= 2.5                   ~ "Good",
+        TRUE                               ~ "Standard"
+      ),
+      grade_band = cut(grade_num,
+        breaks = c(-Inf, 55, 79, 85, 99, 105, 109, 115, 119, 124, 129, Inf),
+        labels = c("5.5","5.6-5.7","5.8","5.9","5.10a/b","5.10c/d",
+                   "5.11a/b","5.11c/d","5.12a/b","5.12c/d","5.13+"))
+    )
+}
+
+rds_path <- "mp_routes.rds"
+csv_path <- "mp_routes.csv"
+
+if (file.exists(rds_path)) {
+  routes <- readRDS(rds_path)
+  if (any(is.na(names(routes)) | names(routes) == "")) {
+    routes <- build_routes(read.csv(csv_path, stringsAsFactors = FALSE, check.names = FALSE))
+    saveRDS(routes, rds_path)
+  }
+} else if (file.exists(csv_path)) {
+  routes <- build_routes(read.csv(csv_path, stringsAsFactors = FALSE, check.names = FALSE))
+  saveRDS(routes, rds_path)
+} else {
+  stop("Place mp_routes.rds or mp_routes.csv in the same folder as this .qmd file.")
+}
+
+# Pre-compute summaries used across pages
+TIER_COLS <- c(
+  "Classic"  = "#E8593C",
+  "Solid"    = "#EF9F27",
+  "Good"     = "#3B8BD4",
+  "Standard" = "#B4B2A9"
+)
+
+TYPE_COLS <- c(
+  "Sport"   = "#185FA5",
+  "Trad"    = "#1D9E75",
+  "Boulder" = "#E8593C",
+  "Alpine"  = "#7F77DD",
+  "Other"   = "#B4B2A9"
+)
+
+n_routes   <- nrow(routes)
+n_states   <- n_distinct(routes$state)
+n_crags    <- n_distinct(routes$crag)
+n_classics <- sum(routes$is_classic)
+avg_stars  <- round(mean(routes$avg_stars, na.rm = TRUE), 1)
+```
+
+# Overview
+
+## Row {height="18%"}
+
+```{r}
+#| content: valuebox
+#| title: "US Routes"
+list(icon = "map", color = "#185FA5", value = format(n_routes, big.mark = ","))
+```
+
+```{r}
+#| content: valuebox
+#| title: "Climbing Walls"
+list(icon = "geo-alt", color = "#1D9E75", value = format(n_crags, big.mark = ","))
+```
+
+```{r}
+#| content: valuebox
+#| title: "States Covered"
+list(icon = "flag", color = "#7F77DD", value = n_states)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Classic Routes"
+list(icon = "star", color = "#EF9F27", value = format(n_classics, big.mark = ","))
+```
+
+```{r}
+#| content: valuebox
+#| title: "Avg Star Rating"
+list(icon = "bar-chart", color = "#E8593C", value = avg_stars)
+```
+
+## Row {height="82%"}
+
+### Column {width="60%"}
+
+```{r}
+#| title: "Climbing walls across the US"
+#| padding: 0
+
+crag_map <- routes |>
+  group_by(crag, state, lat, lon) |>
+  summarise(
+    route_count = n(),
+    avg_stars   = round(mean(avg_stars, na.rm = TRUE), 2),
+    n_classic   = sum(is_classic, na.rm = TRUE),
+    top_grade   = rating[which.max(grade_num)],
+    top_route   = Route[which.max(avg_stars)],
+    .groups     = "drop"
+  ) |>
+  filter(!is.na(lat), !is.na(lon)) |>
+  arrange(desc(route_count)) |>
+  slice_head(n = 500)
+
+pal <- colorNumeric(
+  palette = c("#3B8BD4","#1D9E75","#EF9F27","#E8593C"),
+  domain  = c(0, 4)
+)
+
+popup_html <- sprintf(
+  "<div style='font-family:sans-serif;font-size:13px;min-width:180px'>
+     <b style='font-size:14px'>%s</b><br>
+     <span style='color:#888'>%s</span>
+     <hr style='margin:5px 0'>
+     <b>%d</b> routes &nbsp;|&nbsp; avg <b>%.1f</b> &#9733;<br>
+     <span style='color:#888'>%d classic%s</span><br>
+     Hardest: <b>%s</b><br>
+     Best rated: <i>%s</i>
+   </div>",
+  crag_map$crag, crag_map$state,
+  crag_map$route_count, crag_map$avg_stars,
+  crag_map$n_classic, ifelse(crag_map$n_classic == 1, "", "s"),
+  crag_map$top_grade, crag_map$top_route
+)
+
+leaflet(crag_map, options = leafletOptions(minZoom = 3)) |>
+  addProviderTiles("CartoDB.Positron") |>
+  setView(lng = -98, lat = 39, zoom = 4) |>
+  addCircleMarkers(
+    lng         = ~lon, lat = ~lat,
+    radius      = ~pmax(4, pmin(sqrt(route_count) * 2, 20)),
+    fillColor   = ~pal(avg_stars),
+    fillOpacity = 0.75,
+    color       = "#ffffff",
+    weight      = 1.2,
+    popup       = popup_html,
+    label       = ~paste0(crag, " (", route_count, " routes)"),
+    clusterOptions = markerClusterOptions(
+      maxClusterRadius = 40,
+      showCoverageOnHover = FALSE
+    )
+  ) |>
+  addLegend("bottomright",
+    colors  = c("#3B8BD4","#1D9E75","#EF9F27","#E8593C"),
+    labels  = c("0-1 stars","1-2 stars","2-3 stars","3-4 stars"),
+    title   = "Avg stars", opacity = 0.9
+  )
+```
+
+### Column {width="40%"}
+
+```{r}
+#| title: "Routes by state (top 20)"
+
+routes |>
+  count(state, sort = TRUE) |>
+  slice_head(n = 20) |>
+  mutate(state = factor(state, levels = rev(state))) |>
+  ggplot(aes(x = state, y = n)) +
+  geom_col(fill = "#185FA5", width = 0.7) +
+  geom_text(aes(label = format(n, big.mark = ",")),
+            hjust = -0.1, size = 3, color = "#3d3d3a") +
+  coord_flip(clip = "off") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "Routes") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank())
+```
+
+# Grades & Quality
+
+## Row
+
+### Column {width="50%"}
+
+```{r}
+#| title: "Grade distribution by quality tier"
+
+routes |>
+  filter(!is.na(grade_band)) |>
+  count(grade_band, route_tier) |>
+  mutate(route_tier = factor(route_tier, levels = names(TIER_COLS))) |>
+  ggplot(aes(x = grade_band, y = n, fill = route_tier)) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  scale_fill_manual(values = TIER_COLS, name = "Quality tier") +
+  labs(x = NULL, y = "Number of routes") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank(),
+        legend.position    = "bottom")
+```
+
+### Column {width="50%"}
+
+```{r}
+#| title: "Route type breakdown"
+
+routes |>
+  count(climb_type, route_tier) |>
+  filter(!is.na(climb_type)) |>
+  mutate(route_tier = factor(route_tier, levels = names(TIER_COLS))) |>
+  ggplot(aes(x = reorder(climb_type, n, sum), y = n, fill = route_tier)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = TIER_COLS, name = "Quality tier") +
+  labs(x = NULL, y = "Number of routes") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank(),
+        legend.position    = "bottom")
+```
+
+## Row
+
+### Column {width="50%"}
+
+```{r}
+#| title: "Top 15 walls by route count"
+
+routes |>
+  count(crag, sort = TRUE) |>
+  slice_head(n = 15) |>
+  mutate(crag = factor(crag, levels = rev(crag))) |>
+  ggplot(aes(x = crag, y = n)) +
+  geom_col(fill = "#1D9E75", width = 0.7) +
+  geom_text(aes(label = n), hjust = -0.15, size = 3.2, color = "#3d3d3a") +
+  coord_flip(clip = "off") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "Routes") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank())
+```
+
+### Column {width="50%"}
+
+```{r}
+#| title: "Star rating distribution"
+
+routes |>
+  filter(!is.na(avg_stars)) |>
+  ggplot(aes(x = avg_stars)) +
+  geom_histogram(binwidth = 0.25, fill = "#EF9F27", color = "white", linewidth = 0.3) +
+  geom_vline(xintercept = mean(routes$avg_stars, na.rm = TRUE),
+             linetype = "dashed", color = "#E8593C", linewidth = 0.8) +
+  annotate("text", x = mean(routes$avg_stars, na.rm = TRUE) + 0.08,
+           y = Inf, vjust = 2, hjust = 0, size = 3.2, color = "#E8593C",
+           label = paste0("mean = ", round(mean(routes$avg_stars, na.rm = TRUE), 2))) +
+  labs(x = "Average stars", y = "Number of routes") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+# Top Classics
+
+## Row {height="100%"}
+
+```{r}
+#| title: "Top classic routes (3.8+ stars, 20+ votes)"
+
+routes |>
+  filter(is_classic) |>
+  arrange(desc(avg_stars), desc(num_votes)) |>
+  slice_head(n = 100) |>
+  mutate(
+    Route = ifelse(
+      !is.na(URL) & nchar(URL) > 0,
+      paste0('<a href="', URL, '" target="_blank">', Route, '</a>'),
+      Route
+    ),
+    Stars = round(avg_stars, 1)
+  ) |>
+  select(Route, Wall = crag, State = state,
+         Grade = rating, Stars, Votes = num_votes,
+         Type = climb_type, Tier = route_tier) |>
+  datatable(
+    escape   = FALSE,
+    rownames = FALSE,
+    options  = list(
+      pageLength = 15,
+      dom        = "ftp",
+      order      = list(list(4L, "desc")),
+      columnDefs = list(
+        list(className = "dt-center", targets = c(3, 4, 5, 6, 7))
+      )
+    )
+  ) |>
+  formatStyle("Stars",
+    background         = styleColorBar(c(0, 4), "#FAEEDA"),
+    backgroundSize     = "100% 80%",
+    backgroundRepeat   = "no-repeat",
+    backgroundPosition = "center"
+  ) |>
+  formatStyle("Tier",
+    backgroundColor = styleEqual(
+      c("Classic","Solid","Good","Standard"),
+      c("#FAEEDA","#FFF5E0","#E6F1FB","#F1EFE8")
+    ),
+    color = styleEqual(
+      c("Classic","Solid","Good","Standard"),
+      c("#633806","#4A2E00","#042C53","#444441")
+    )
+  )
+```
+
