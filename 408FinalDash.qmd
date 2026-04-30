@@ -1,0 +1,742 @@
+---
+title: "Mountain Project Climbing Route Recommender"
+author: "Mason Barnocky"
+format:
+  dashboard:
+    theme: cosmo
+    nav-buttons:
+      - icon: github
+        href: https://github.com/mojo1019/STAT408Final
+server: shiny
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| context: setup
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(leaflet)
+library(DT)
+library(shiny)
+
+US_STATES <- c(
+  "Alabama","Alaska","Arizona","Arkansas","California","Colorado",
+  "Connecticut","Delaware","Florida","Georgia","Hawaii","Idaho",
+  "Illinois","Indiana","Iowa","Kansas","Kentucky","Louisiana","Maine",
+  "Maryland","Massachusetts","Michigan","Minnesota","Mississippi",
+  "Missouri","Montana","Nebraska","Nevada","New Hampshire","New Jersey",
+  "New Mexico","New York","North Carolina","North Dakota","Ohio",
+  "Oklahoma","Oregon","Pennsylvania","Rhode Island","South Carolina",
+  "South Dakota","Tennessee","Texas","Utah","Vermont","Virginia",
+  "Washington","West Virginia","Wisconsin","Wyoming"
+)
+
+EXPERIENCE_RANGES <- list(
+  all          = NULL,
+  beginner     = c(40,  85),
+  intermediate = c(90,  109),
+  advanced     = c(110, 119),
+  expert       = c(120, 160)
+)
+
+TIER_COLS <- c(
+  "Classic"  = "#E8593C",
+  "Solid"    = "#EF9F27",
+  "Good"     = "#3B8BD4",
+  "Standard" = "#B4B2A9"
+)
+
+TYPE_COLS <- c(
+  "Sport"   = "#185FA5",
+  "Trad"    = "#1D9E75",
+  "Boulder" = "#E8593C",
+  "Alpine"  = "#7F77DD",
+  "Other"   = "#B4B2A9"
+)
+
+parse_grade_numeric <- function(rating) {
+  r        <- str_trim(rating)
+  base_num <- suppressWarnings(as.integer(str_match(r, "5\\.(\\d+)")[, 2]))
+  mod      <- str_extract(r, "[abcd+\\-]$")
+  dplyr::case_when(
+    is.na(base_num) ~ NA_real_,
+    mod == "a" ~ base_num * 10 + 0,
+    mod == "b" ~ base_num * 10 + 2,
+    mod == "c" ~ base_num * 10 + 5,
+    mod == "d" ~ base_num * 10 + 8,
+    mod == "+" ~ base_num * 10 + 9,
+    mod == "-" ~ base_num * 10 - 1,
+    TRUE       ~ base_num * 10 + 4
+  )
+}
+
+primary_type <- function(type_str) {
+  dplyr::case_when(
+    str_detect(type_str, regex("boulder", ignore_case = TRUE)) ~ "Boulder",
+    str_detect(type_str, regex("sport",   ignore_case = TRUE)) ~ "Sport",
+    str_detect(type_str, regex("trad",    ignore_case = TRUE)) ~ "Trad",
+    str_detect(type_str, regex("alpine",  ignore_case = TRUE)) ~ "Alpine",
+    TRUE ~ "Other"
+  )
+}
+
+clean_col_names <- function(df) {
+  names(df) <- trimws(names(df))
+  df <- df[, !(names(df) == "" | grepl("^Unnamed", names(df))), drop = FALSE]
+  names(df)[names(df) == "Avg Stars"]      <- "avg_stars"
+  names(df)[names(df) == "Route Type"]     <- "route_type"
+  names(df)[names(df) == "Pitches"]        <- "pitches"
+  names(df)[names(df) == "Area Latitude"]  <- "lat"
+  names(df)[names(df) == "Area Longitude"] <- "lon"
+  names(df)[names(df) == "Rating"]         <- "rating"
+  names(df)[names(df) == "num_votes"]      <- "num_votes"
+  df
+}
+
+build_routes <- function(raw) {
+  raw        <- clean_col_names(raw)
+  parts_list <- str_split(raw$Location, " > ")
+  raw$state  <- vapply(parts_list, function(p) { p <- trimws(p); p[length(p)] }, character(1))
+  raw$crag   <- vapply(parts_list, function(p) trimws(p)[1], character(1))
+  raw |>
+    filter(state %in% US_STATES,
+           !is.na(lat), !is.na(lon),
+           lat >= 18, lat <= 72, lon >= -180, lon <= -66) |>
+    mutate(
+      grade_num  = parse_grade_numeric(rating),
+      climb_type = primary_type(route_type),
+      num_votes  = pmax(1L, suppressWarnings(as.integer(num_votes)), na.rm = TRUE),
+      avg_stars  = as.numeric(avg_stars),
+      pitches    = pmax(1L, suppressWarnings(as.integer(pitches)), na.rm = TRUE),
+      is_classic = avg_stars >= 3.8 & num_votes >= 20,
+      route_tier = dplyr::case_when(
+        avg_stars >= 3.8 & num_votes >= 20 ~ "Classic",
+        avg_stars >= 3.2 & num_votes >= 10 ~ "Solid",
+        avg_stars >= 2.5                   ~ "Good",
+        TRUE                               ~ "Standard"
+      ),
+      grade_band = cut(grade_num,
+        breaks = c(-Inf, 55, 79, 85, 99, 105, 109, 115, 119, 124, 129, Inf),
+        labels = c("5.5","5.6-5.7","5.8","5.9","5.10a/b","5.10c/d",
+                   "5.11a/b","5.11c/d","5.12a/b","5.12c/d","5.13+"))
+    )
+}
+
+# Bayesian quality + grade-match composite score
+score_routes <- function(df, grade_mid) {
+  C_global <- mean(df$avg_stars, na.rm = TRUE)
+  df |>
+    mutate(
+      bayesian_q  = (num_votes / (num_votes + 10)) * avg_stars +
+                    (10 / (num_votes + 10)) * C_global,
+      grade_match = exp(-0.5 * ((grade_num - grade_mid) / 15)^2),
+      pitch_bonus = dplyr::case_when(
+        pitches > 5 ~ 0.25, pitches > 1 ~ 0.10, TRUE ~ 0.00
+      ),
+      classic_bonus = ifelse(is_classic, 0.20, 0),
+      score = round(
+        (bayesian_q * 0.45 + grade_match * 0.30 +
+         pitch_bonus * 0.10 + classic_bonus * 0.15) * (10 / 4), 1
+      )
+    ) |>
+    arrange(desc(score))
+}
+
+rds_path <- "mp_routes.rds"
+csv_path <- "mp_routes.csv"
+
+if (file.exists(rds_path)) {
+  routes <- readRDS(rds_path)
+  if (any(is.na(names(routes)) | names(routes) == "")) {
+    routes <- build_routes(read.csv(csv_path, stringsAsFactors = FALSE,
+                                    check.names = FALSE))
+    saveRDS(routes, rds_path)
+  }
+} else if (file.exists(csv_path)) {
+  routes <- build_routes(read.csv(csv_path, stringsAsFactors = FALSE,
+                                  check.names = FALSE))
+  saveRDS(routes, rds_path)
+} else {
+  stop("Place mp_routes.rds or mp_routes.csv in the same folder as this .qmd file.")
+}
+
+ALL_TYPES  <- sort(unique(routes$climb_type))
+GRADE_MIN  <- min(routes$grade_num, na.rm = TRUE)
+GRADE_MAX  <- max(routes$grade_num, na.rm = TRUE)
+```
+
+##  {.sidebar}
+
+**Filter Routes**
+
+```{r}
+selectInput(
+  "experience", "Experience level",
+  choices = c(
+    "All grades"               = "all",
+    "Beginner (5.4-5.8)"       = "beginner",
+    "Intermediate (5.9-5.10d)" = "intermediate",
+    "Advanced (5.11-5.11d)"    = "advanced",
+    "Expert (5.12+)"           = "expert"
+  ),
+  selected = "intermediate"
+)
+
+selectInput(
+  "sel_state", "State",
+  choices  = c("All states" = "", sort(unique(routes$state))),
+  selected = ""
+)
+
+checkboxGroupInput(
+  "climb_types", "Climbing style",
+  choices  = ALL_TYPES,
+  selected = c("Sport", "Trad")
+)
+
+sliderInput(
+  "min_stars", "Minimum stars",
+  min = 0, max = 4, value = 2.5, step = 0.5
+)
+
+checkboxInput("only_classics",   "Classics only (3.8+ stars)", FALSE)
+checkboxInput("only_multipitch", "Multi-pitch only",           FALSE)
+```
+
+------------------------------------------------------------------------
+
+*Filters apply to the Recommendations page. The Data and Analysis pages show the full dataset.*
+
+# About the Data
+
+## Row {height="20%"}
+
+```{r}
+#| content: valuebox
+#| title: "US Routes"
+list(icon = "map", color = "#185FA5",
+     value = format(nrow(routes), big.mark = ","))
+```
+
+```{r}
+#| content: valuebox
+#| title: "Climbing Walls"
+list(icon = "geo-alt", color = "#1D9E75",
+     value = format(n_distinct(routes$crag), big.mark = ","))
+```
+
+```{r}
+#| content: valuebox
+#| title: "States"
+list(icon = "flag", color = "#7F77DD",
+     value = n_distinct(routes$state))
+```
+
+```{r}
+#| content: valuebox
+#| title: "Classic Routes"
+list(icon = "star", color = "#EF9F27",
+     value = format(sum(routes$is_classic), big.mark = ","))
+```
+
+```{r}
+#| content: valuebox
+#| title: "Avg Star Rating"
+list(icon = "bar-chart", color = "#E8593C",
+     value = round(mean(routes$avg_stars, na.rm = TRUE), 1))
+```
+
+## Row {height="80%"}
+
+### Column {width="55%"}
+
+```{r}
+#| title: "Where are the climbs? (Top 500 walls)"
+#| padding: 0
+
+# Build crag summary (top 500 walls by route count)
+crag_map <- routes |>
+  group_by(crag, state, lat, lon) |>
+  summarise(
+    route_count = n(),
+    avg_stars   = round(mean(avg_stars, na.rm = TRUE), 2),
+    n_classic   = sum(is_classic, na.rm = TRUE),
+    top_grade   = rating[which.max(grade_num)],
+    .groups     = "drop"
+  ) |>
+  filter(!is.na(lat), !is.na(lon)) |>
+  arrange(desc(route_count)) |>
+  slice_head(n = 500)
+
+pal <- colorNumeric(
+  palette = c("#3B8BD4","#1D9E75","#EF9F27","#E8593C"),
+  domain  = c(0, 4)
+)
+
+# Pre-split routes by crag once (O(n)) so popup building is fast
+visible_crags  <- crag_map$crag
+routes_visible <- routes[routes$crag %in% visible_crags, ]
+crag_split     <- split(routes_visible, routes_visible$crag)
+
+# Build popup HTML for each crag: header stats + top-8 route list
+build_popup <- function(i) {
+  cn  <- crag_map$crag[i]
+  cr  <- crag_split[[cn]]
+  if (is.null(cr) || nrow(cr) == 0) return("")
+
+  # Sort by Bayesian quality proxy
+  C  <- mean(cr$avg_stars, na.rm = TRUE)
+  cr <- cr |>
+    mutate(bq = (num_votes / (num_votes + 10)) * avg_stars +
+                (10 / (num_votes + 10)) * C) |>
+    arrange(desc(bq))
+
+  top8 <- head(cr, 8)
+
+  tier_color <- function(t) switch(t,
+    "Classic" = "#E8593C", "Solid" = "#EF9F27",
+    "Good"    = "#3B8BD4", "#B4B2A9"
+  )
+
+  route_rows <- paste(vapply(seq_len(nrow(top8)), function(j) {
+    r        <- top8[j, ]
+    tc       <- tier_color(r$route_tier)
+    name_tag <- if (!is.na(r$URL) && nchar(r$URL) > 0)
+      sprintf('<a href="%s" target="_blank"
+               style="color:#185FA5;text-decoration:none;font-weight:500">%s</a>',
+              r$URL, r$Route)
+    else
+      sprintf('<span style="font-weight:500">%s</span>', r$Route)
+    sprintf(
+      '<div style="padding:4px 0;border-bottom:1px solid #f0ede8">
+         %s
+         <span style="float:right;font-size:10px;background:%s;color:#fff;
+                      padding:1px 5px;border-radius:3px">%s</span><br>
+         <span style="font-size:11px;color:#777">%s &nbsp;|&nbsp; %s &nbsp;|&nbsp; %.1f &#9733;</span>
+       </div>',
+      name_tag, tc, r$route_tier,
+      r$rating, r$climb_type, r$avg_stars
+    )
+  }, character(1)), collapse = "")
+
+  more <- if (crag_map$route_count[i] > 8)
+    sprintf('<div style="margin-top:6px;font-size:11px;color:#888;text-align:center">
+               + %d more routes on Mountain Project
+             </div>', crag_map$route_count[i] - 8)
+  else ""
+
+  sprintf(
+    '<div style="font-family:sans-serif;font-size:13px;
+                 min-width:240px;max-width:300px">
+       <b style="font-size:15px">%s</b><br>
+       <span style="color:#888;font-size:12px">%s</span>
+       <hr style="margin:6px 0">
+       <div style="font-size:12px;color:#555;margin-bottom:8px">
+         <b>%d</b> route%s &nbsp;|&nbsp; avg <b>%.1f</b> &#9733; &nbsp;|&nbsp;
+         hardest <b>%s</b>
+       </div>
+       %s%s
+     </div>',
+    cn, crag_map$state[i],
+    crag_map$route_count[i], ifelse(crag_map$route_count[i] == 1, "", "s"),
+    crag_map$avg_stars[i], crag_map$top_grade[i],
+    route_rows, more
+  )
+}
+
+popup_html <- vapply(seq_len(nrow(crag_map)), build_popup, character(1))
+
+leaflet(crag_map, options = leafletOptions(minZoom = 3)) |>
+  addProviderTiles("CartoDB.Positron") |>
+  setView(lng = -98, lat = 39, zoom = 4) |>
+  addCircleMarkers(
+    lng = ~lon, lat = ~lat,
+    radius      = ~pmax(4, pmin(sqrt(route_count) * 2, 20)),
+    fillColor   = ~pal(avg_stars),
+    fillOpacity = 0.75,
+    color       = "#ffffff",
+    weight      = 1.2,
+    popup       = popup_html,
+    label       = ~paste0(crag, " (", route_count, " routes)"),
+    clusterOptions = markerClusterOptions(
+      maxClusterRadius = 40, showCoverageOnHover = FALSE
+    )
+  ) |>
+  addLegend("bottomright",
+    colors  = c("#3B8BD4","#1D9E75","#EF9F27","#E8593C"),
+    labels  = c("0-1","1-2","2-3","3-4"),
+    title   = "Avg stars", opacity = 0.9
+  )
+```
+
+### Column {width="45%"}
+
+```{r}
+#| title: "About this project"
+
+tags$div(
+  style = "padding: 4px 8px; font-size: 14px; line-height: 1.7;",
+  tags$p(
+    "This dashboard explores nearly ", tags$b("90,000 climbing routes"),
+    " across the United States sourced from ",
+    tags$a("Mountain Project", href = "https://www.mountainproject.com",
+           target = "_blank"),
+    ", the largest crowd-sourced climbing database in North America."
+  ),
+  tags$p(
+    "The goal is to help climbers answer: ",
+    tags$i("Where should I climb? What routes match my ability?
+            What are the best climbs near me?")
+  ),
+  tags$p(tags$b("What the data contains:")),
+  tags$ul(
+    tags$li("Route name, grade (YDS), and type (sport, trad, boulder, alpine)"),
+    tags$li("Average star rating and number of votes from the community"),
+    tags$li("GPS coordinates, pitch count, and route length"),
+    tags$li("Location hierarchy: wall > sub-area > region > state")
+  ),
+  tags$p(tags$b("What this dashboard shows:")),
+  tags$ul(
+    tags$li(tags$b("About the Data"), " — dataset overview and geographic distribution"),
+    tags$li(tags$b("Analysis"), " — grade distributions and quality patterns"),
+    tags$li(tags$b("Recommendations"), " — personalized route suggestions using the sidebar filters"),
+    tags$li(tags$b("Summary"), " — key findings and further resources")
+  ),
+  tags$p(
+    "Use the ", tags$b("sidebar filters"), " to narrow routes by experience level,
+    state, climbing style, and star rating. Filters apply on the Recommendations page."
+  )
+)
+```
+
+```{r}
+#| title: "Routes by state (top 15)"
+
+routes |>
+  count(state, sort = TRUE) |>
+  slice_head(n = 15) |>
+  mutate(state = factor(state, levels = rev(state))) |>
+  ggplot(aes(x = state, y = n)) +
+  geom_col(fill = "#185FA5", width = 0.7) +
+  geom_text(aes(label = format(n, big.mark = ",")),
+            hjust = -0.1, size = 3, color = "#3d3d3a") +
+  coord_flip(clip = "off") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  labs(x = NULL, y = "Number of routes") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank())
+```
+
+# Analysis
+
+## Row
+
+### Column {width="50%"}
+
+```{r}
+#| title: "Grade distribution by quality tier"
+
+routes |>
+  filter(!is.na(grade_band)) |>
+  count(grade_band, route_tier) |>
+  mutate(route_tier = factor(route_tier, levels = names(TIER_COLS))) |>
+  ggplot(aes(x = grade_band, y = n, fill = route_tier)) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  scale_fill_manual(values = TIER_COLS, name = "Quality tier") +
+  labs(x = NULL, y = "Number of routes",
+       caption = "Classic = 3.8+ stars with 20+ votes") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank(),
+        legend.position    = "bottom")
+```
+
+### Column {width="50%"}
+
+```{r}
+#| title: "Route type breakdown by quality"
+
+routes |>
+  count(climb_type, route_tier) |>
+  filter(!is.na(climb_type)) |>
+  mutate(route_tier = factor(route_tier, levels = names(TIER_COLS))) |>
+  ggplot(aes(x = reorder(climb_type, n, sum), y = n, fill = route_tier)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = TIER_COLS, name = "Quality tier") +
+  labs(x = NULL, y = "Number of routes") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank(),
+        legend.position    = "bottom")
+```
+
+## Row
+
+### Column {width="50%"}
+
+```{r}
+#| title: "Star rating distribution across all routes"
+
+mean_stars <- round(mean(routes$avg_stars, na.rm = TRUE), 2)
+med_stars  <- round(median(routes$avg_stars, na.rm = TRUE), 2)
+
+routes |>
+  filter(!is.na(avg_stars)) |>
+  ggplot(aes(x = avg_stars)) +
+  geom_histogram(binwidth = 0.25, fill = "#EF9F27", color = "white",
+                 linewidth = 0.3) +
+  geom_vline(xintercept = mean_stars, linetype = "dashed",
+             color = "#E8593C", linewidth = 0.9) +
+  annotate("text", x = mean_stars + 0.1, y = Inf, vjust = 2,
+           hjust = 0, size = 3.2, color = "#E8593C",
+           label = paste0("mean = ", mean_stars)) +
+  labs(x = "Average star rating", y = "Number of routes",
+       caption = paste0("Median = ", med_stars,
+                        "  |  Routes with 0 stars are unrated")) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+### Column {width="50%"}
+
+```{r}
+#| title: "Summary statistics"
+
+# Summary table by climbing type
+routes |>
+  group_by(Type = climb_type) |>
+  summarise(
+    Routes      = n(),
+    `Avg Stars` = round(mean(avg_stars, na.rm = TRUE), 2),
+    `Classics`  = sum(is_classic),
+    `% Classic` = paste0(round(mean(is_classic) * 100, 1), "%"),
+    `Avg Pitches` = round(mean(pitches, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) |>
+  arrange(desc(Routes)) |>
+  datatable(
+    rownames = FALSE,
+    options  = list(
+      dom        = "t",
+      pageLength = 10,
+      order      = list(list(1L, "desc"))
+    )
+  ) |>
+  formatStyle("Avg Stars",
+    background         = styleColorBar(c(0, 4), "#FAEEDA"),
+    backgroundSize     = "100% 80%",
+    backgroundRepeat   = "no-repeat",
+    backgroundPosition = "center"
+  )
+```
+
+# Recommendations
+
+## Row {height="100%"}
+
+### Column {width="40%"}
+
+```{r}
+plotOutput("rec_chart", height = "500px")
+```
+
+```{r}
+#| title: "How routes are scored"
+
+tags$div(
+  style = "font-size:13px; line-height:1.7; padding: 4px 8px;",
+  tags$p(
+    "Routes are ranked using a composite score (0–10) that combines four signals:"
+  ),
+  tags$ul(
+    tags$li(tags$b("Bayesian quality (45%)"), " — a star rating adjusted for
+            vote count. Routes with few votes are pulled toward the global average
+            so a single 4-star vote doesn't outrank a 3.9-star route with 500 votes."),
+    tags$li(tags$b("Grade match (30%)"), " — a score that peaks at your
+            experience level and falls off smoothly for routes that are too easy
+            or too hard."),
+    tags$li(tags$b("Classic bonus (15%)"), " — extra credit for routes with
+            3.8+ stars and at least 20 community votes."),
+    tags$li(tags$b("Pitch bonus (10%)"), " — a small boost for multi-pitch
+            routes, reflecting their greater commitment and adventure.")
+  )
+)
+```
+
+### Column {width="60%"}
+
+```{r}
+DTOutput("rec_table")
+```
+
+```{r}
+#| context: server
+
+# ── Reactive filtered + scored dataset ──────────────────
+filtered <- reactive({
+  types <- if (length(input$climb_types) == 0) ALL_TYPES else input$climb_types
+  gr    <- EXPERIENCE_RANGES[[input$experience]]
+  gm    <- if (is.null(gr)) mean(c(GRADE_MIN, GRADE_MAX)) else mean(gr)
+
+  df <- routes |>
+    filter(
+      climb_type %in% types,
+      avg_stars  >= input$min_stars
+    )
+
+  if (!is.null(gr))
+    df <- df |> filter(grade_num >= gr[1], grade_num <= gr[2])
+
+  if (nchar(input$sel_state) > 0)
+    df <- df[df$state == input$sel_state, ]
+
+  if (isTRUE(input$only_classics))    df <- df[df$is_classic,    ]
+  if (isTRUE(input$only_multipitch))  df <- df[df$is_multipitch, ]
+
+  score_routes(df, gm)
+}) |> debounce(300)
+
+# ── Top climbs bar chart ─────────────────────────────────
+output$rec_chart <- renderPlot({
+  df <- slice_head(filtered(), n = 15)
+
+  if (nrow(df) == 0) {
+    ggplot() +
+      annotate("text", x = 1, y = 1, label = "No routes match your filters.",
+               size = 5, color = "#888") +
+      theme_void()
+  } else {
+    df <- slice_head(df, n = 10) |>
+      mutate(
+        # Truncate long route names and show grade + wall as subtitle on bar
+        name_short  = str_trunc(Route, 28, ellipsis = "..."),
+        wall_short  = str_trunc(crag,  22, ellipsis = "..."),
+        bar_label   = paste0(rating, " · ", wall_short),
+        label       = factor(name_short, levels = rev(name_short))
+      )
+    ggplot(df, aes(x = label, y = score, fill = climb_type)) +
+      geom_col(width = 0.65) +
+      # Score on the right end of the bar
+      geom_text(aes(label = paste0(score, "/10")),
+                hjust = -0.1, size = 3.0, color = "#3d3d3a") +
+      # Grade + wall inside the bar
+      geom_text(aes(label = bar_label, y = 0.25),
+                hjust = 0, size = 2.8, color = "white", fontface = "plain") +
+      coord_flip(clip = "off") +
+      scale_fill_manual(values = TYPE_COLS, name = "Type") +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.22))) +
+      labs(title = "Top 10 recommended climbs",
+           x = NULL, y = "Score (0-10)") +
+      theme_minimal(base_size = 11) +
+      theme(
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank(),
+        legend.position    = "bottom",
+        plot.title         = element_text(size = 13, face = "plain"),
+        axis.text.y        = element_text(size = 10, lineheight = 1.0)
+      )
+  }
+})
+
+# ── Recommendation table ─────────────────────────────────
+output$rec_table <- renderDT({
+  df <- slice_head(filtered(), n = 100) |>
+    mutate(
+      Route = ifelse(
+        !is.na(URL) & nchar(URL) > 0,
+        paste0('<a href="', URL, '" target="_blank">', Route, '</a>'),
+        Route
+      ),
+      Stars = round(avg_stars, 1)
+    ) |>
+    select(Route, Wall = crag, State = state, Grade = rating,
+           Stars, Votes = num_votes, Type = climb_type,
+           Pitches = pitches, Score = score, Tier = route_tier)
+
+  datatable(df,
+    escape   = FALSE,
+    rownames = FALSE,
+    caption  = "Top 100 matching routes ranked by recommendation score",
+    options  = list(
+      pageLength = 15,
+      dom        = "ftp",
+      order      = list(list(8L, "desc")),
+      columnDefs = list(
+        list(className = "dt-center", targets = c(3, 4, 5, 6, 7, 8))
+      )
+    )
+  ) |>
+    formatStyle("Score",
+      background         = styleColorBar(c(0, 10), "#B5D4F4"),
+      backgroundSize     = "100% 80%",
+      backgroundRepeat   = "no-repeat",
+      backgroundPosition = "center"
+    ) |>
+    formatStyle("Tier",
+      backgroundColor = styleEqual(
+        c("Classic","Solid","Good","Standard"),
+        c("#FAEEDA","#FFF5E0","#E6F1FB","#F1EFE8")
+      ),
+      color = styleEqual(
+        c("Classic","Solid","Good","Standard"),
+        c("#633806","#4A2E00","#042C53","#444441")
+      )
+    )
+})
+```
+
+# Summary
+
+## Row
+
+### Column {width="60%"}
+
+::: {.card title="What this project found"}
+This dashboard set out to answer a simple question that every climber faces: **where should I climb, and what routes are right for me?** After exploring nearly 90,000 routes across the United States, a few clear patterns emerged.
+
+**The data is heavily skewed toward the West.** Colorado, California, and Utah together account for over a third of all routes in the dataset. This reflects both the concentration of quality climbing terrain and the demographics of Mountain Project's user base, which trends toward western sport and trad climbers.
+
+**Moderate grades dominate.** The 5.9–5.10 range has by far the most routes, with Classic-tier quality concentrated in the 5.10–5.11 window. This suggests that the sweet spot for finding high-quality climbing with lots of options is the intermediate grade range, which aligns with where most experienced recreational climbers operate.
+
+**Star ratings are unreliable without vote context.** Many routes have high average stars but only one or two votes — these are not the same as a 4-star route with 500 votes. The Bayesian scoring approach used in the Recommendations page addresses this directly by pulling low-vote ratings toward the global mean of about 3.2 stars.
+
+**Sport climbing has the most routes; trad has the highest classic rate.** Despite sport climbing dominating in raw numbers, trad routes punch above their weight in the Classic tier — likely reflecting the longer history, greater commitment, and stronger community curation around trad climbing destinations.
+
+**The recommendation system meaningfully reorders results.** Simple star-rating filters return routes that look good on paper but may be at the wrong grade, too far away, or obscure. The composite score — combining quality, grade fit, pitch count, and classic status — surfaces routes that are both high quality and appropriate for the user's stated level.
+:::
+
+### Column {width="40%"}
+
+::: {.card title="Further resources"}
+**Climbing data & community**
+
+-   [Mountain Project](https://www.mountainproject.com) — the source dataset; route pages, area guides, and conditions reports
+-   [The Crag](https://www.thecrag.com) — alternative global climbing database with similar data
+-   [OpenBeta](https://openbeta.io) — open-source climbing database with a public API
+
+**Learning more about the methods**
+
+-   [Bayesian average ratings](https://www.evanmiller.org/bayesian-average-ratings.html) — the theory behind the IMDb-style weighted score used in this project
+-   [Leaflet for R](https://rstudio.github.io/leaflet/) — documentation for the interactive maps used throughout
+-   [Quarto dashboards](https://quarto.org/docs/dashboards/) — how this dashboard was built
+
+**R packages used**
+
+-   [`dplyr`](https://dplyr.tidyverse.org) + [`stringr`](https://stringr.tidyverse.org) — data wrangling and location parsing
+-   [`ggplot2`](https://ggplot2.tidyverse.org) — grade pyramid, type breakdown, star distribution
+-   [`leaflet`](https://rstudio.github.io/leaflet/) — interactive climbing wall map
+-   [`DT`](https://rstudio.github.io/DT/) — searchable route recommendation table
+-   [`shiny`](https://shiny.posit.co) — sidebar filters and reactive outputs
+
+**GitHub repository**
+
+Full source code, data, and the companion Shiny app: [github.com/mojo1019/STAT408Final](https://github.com/mojo1019/STAT408Final)
+:::
